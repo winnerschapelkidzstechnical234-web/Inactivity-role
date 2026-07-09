@@ -168,8 +168,11 @@ client.on('messageCreate', async (message) => {
       return message.reply("You don't have access to this command.");
     }
 
-    const mentionedRoles = [...message.mentions.roles.values()];
-    if (mentionedRoles.length < 2) {
+    // Parse role mentions directly from the raw text, in the exact order they appear,
+    // rather than relying on the mentions collection's internal ordering.
+    const roleIdMatches = [...message.content.matchAll(/<@&(\d+)>/g)].map((m) => m[1]);
+    const uniqueRoleIds = [...new Set(roleIdMatches)];
+    if (uniqueRoleIds.length < 2) {
       return message.reply(
         'Mention both roles in order: `!merge @OldRole @NewRole`\n' +
         'Everyone with @OldRole will be given @NewRole. Nothing is removed automatically — ' +
@@ -177,8 +180,12 @@ client.on('messageCreate', async (message) => {
       );
     }
 
-    const oldRole = mentionedRoles[0];
-    const newRole = mentionedRoles[1];
+    const oldRole = message.guild.roles.cache.get(uniqueRoleIds[0]);
+    const newRole = message.guild.roles.cache.get(uniqueRoleIds[1]);
+
+    if (!oldRole || !newRole) {
+      return message.reply('Could not find one of those roles — make sure both are valid, current roles in this server.');
+    }
 
     if (oldRole.id === newRole.id) {
       return message.reply('Those are the same role — nothing to merge.');
@@ -219,13 +226,17 @@ client.on('messageCreate', async (message) => {
       components: [confirmRow],
     });
 
-    const collector = confirmMsg.createMessageComponentCollector({ time: 60000, max: 1 });
+    const authorOnlyFilter = (interaction) => {
+      if (interaction.user.id !== message.author.id) {
+        interaction.reply({ content: 'Only the person who ran this command can confirm it.', ephemeral: true }).catch(() => {});
+        return false; // doesn't count against the collector, so the real author still gets their turn
+      }
+      return true;
+    };
+
+    const collector = confirmMsg.createMessageComponentCollector({ filter: authorOnlyFilter, time: 60000, max: 1 });
 
     collector.on('collect', async (interaction) => {
-      if (interaction.user.id !== message.author.id) {
-        return interaction.reply({ content: 'Only the person who ran this command can confirm it.', ephemeral: true });
-      }
-
       if (interaction.customId === 'merge_cancel') {
         await interaction.update({ content: 'Merge cancelled. No changes were made.', components: [] });
         return;
