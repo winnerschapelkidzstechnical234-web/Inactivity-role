@@ -1,7 +1,15 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-const { Client, GatewayIntentBits, Partials, PermissionsBitField } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  PermissionsBitField,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+} = require('discord.js');
 
 const PREFIX = process.env.PREFIX || '!';
 
@@ -78,7 +86,7 @@ const client = new Client({
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Prefix: ${PREFIX}`);
-  console.log(`Commands: ${PREFIX}inactivity | ${PREFIX}lastseen @user`);
+  console.log(`Commands: ${PREFIX}inactivity | ${PREFIX}lastseen @user | ${PREFIX}merge @OldRole @NewRole`);
   if (TRACKED_VC_IDS.length === 0) {
     console.log('WARNING: No TRACKED_VC_IDS set — voice activity tracking is off until configured.');
   }
@@ -154,6 +162,112 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  // ---------- !merge @OldRole @NewRole ----------
+  if (command === 'merge') {
+    if (!hasAccess(message.member)) {
+      return message.reply("You don't have access to this command.");
+    }
+
+    const mentionedRoles = [...message.mentions.roles.values()];
+    if (mentionedRoles.length < 2) {
+      return message.reply(
+        'Mention both roles in order: `!merge @OldRole @NewRole`\n' +
+        'Everyone with @OldRole will be given @NewRole. Nothing is removed automatically — ' +
+        'once you\'re happy with the result, delete @OldRole yourself in Server Settings > Roles.'
+      );
+    }
+
+    const oldRole = mentionedRoles[0];
+    const newRole = mentionedRoles[1];
+
+    if (oldRole.id === newRole.id) {
+      return message.reply('Those are the same role — nothing to merge.');
+    }
+
+    await message.guild.members.fetch(); // ensure full member cache
+    const membersWithOldRole = message.guild.members.cache.filter((m) => m.roles.cache.has(oldRole.id));
+    const toUpdate = membersWithOldRole.filter((m) => !m.roles.cache.has(newRole.id));
+    const alreadyHadBoth = membersWithOldRole.size - toUpdate.size;
+
+    if (membersWithOldRole.size === 0) {
+      return message.reply(`No members currently have **${oldRole.name}**. Nothing to merge.`);
+    }
+
+    // Make sure the bot can actually assign the new role
+    const botMember = await message.guild.members.fetchMe();
+    if (newRole.position >= botMember.roles.highest.position) {
+      return message.reply(
+        `I can't assign **${newRole.name}** because my role is positioned below it. ` +
+        `Move my bot's role above **${newRole.name}** in Server Settings > Roles, then try again.`
+      );
+    }
+
+    const confirmRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('merge_confirm').setLabel('Confirm Merge').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('merge_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+    );
+
+    const confirmMsg = await message.reply({
+      content:
+        `**Merge check**\n` +
+        `• **${membersWithOldRole.size}** members currently have **${oldRole.name}**\n` +
+        `• **${toUpdate.size}** of them will be given **${newRole.name}**\n` +
+        `• **${alreadyHadBoth}** already have both roles and will be skipped\n\n` +
+        `This does **not** remove **${oldRole.name}** from anyone. Once you've confirmed it worked, ` +
+        `delete that role yourself in Server Settings to clean it up.\n\n` +
+        `Only <@${message.author.id}> can confirm this. This request expires in 60 seconds.`,
+      components: [confirmRow],
+    });
+
+    const collector = confirmMsg.createMessageComponentCollector({ time: 60000, max: 1 });
+
+    collector.on('collect', async (interaction) => {
+      if (interaction.user.id !== message.author.id) {
+        return interaction.reply({ content: 'Only the person who ran this command can confirm it.', ephemeral: true });
+      }
+
+      if (interaction.customId === 'merge_cancel') {
+        await interaction.update({ content: 'Merge cancelled. No changes were made.', components: [] });
+        return;
+      }
+
+      await interaction.update({ content: 'Merging… this may take a moment for large groups.', components: [] });
+
+      const results = { added: [], failed: [] };
+      for (const member of toUpdate.values()) {
+        try {
+          await member.roles.add(newRole);
+          results.added.push(member.user.tag);
+        } catch (err) {
+          console.error(`Failed to add ${newRole.name} to ${member.user.tag}:`, err);
+          results.failed.push(member.user.tag);
+        }
+      }
+
+      const summaryLines = [
+        `**Merge complete: ${oldRole.name} → ${newRole.name}**`,
+        `✅ Given the role: ${results.added.length}`,
+        `ℹ️ Already had both roles (skipped): ${alreadyHadBoth}`,
+      ];
+      if (results.failed.length) {
+        summaryLines.push(`❌ Failed: ${results.failed.length} (${results.failed.join(', ')})`);
+      }
+      summaryLines.push(
+        `\nNothing was removed. Double check the member list, then delete **${oldRole.name}** yourself when you're ready.`
+      );
+
+      await message.channel.send(summaryLines.join('\n'));
+    });
+
+    collector.on('end', async (collected) => {
+      if (collected.size === 0) {
+        await confirmMsg.edit({ content: 'Merge request expired — no changes were made. Run `!merge` again if you still want to do this.', components: [] });
+      }
+    });
+
+    return;
+  }
+
   // ---------- !lastseen @user ----------
   if (command === 'lastseen') {
     if (!hasAccess(message.member)) {
@@ -169,3 +283,4 @@ client.on('messageCreate', async (message) => {
 });
 
 client.login(process.env.DISCORD_TOKEN);
+
