@@ -32,6 +32,19 @@ const ALLOWED_ROLE_IDS = (process.env.ALLOWED_ROLE_ID || '')
 // has a role that implies they're actually verified.
 const UNVERIFIED_ROLE_ID = process.env.UNVERIFIED_ROLE_ID || null;
 
+// --- Automatic Unverified removal (runs on its own schedule, no command needed) ---
+// Role(s) that count as "verified" — anyone with one of these AND Unverified gets Unverified stripped automatically.
+const AUTO_VERIFIED_ROLE_IDS = (process.env.AUTO_VERIFIED_ROLE_ID || '')
+  .split(',')
+  .map((id) => id.trim())
+  .filter(Boolean);
+
+// Channel to post a log message in every time the automatic check runs.
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || null;
+
+// How often to run the automatic check, in hours (defaults to once a day).
+const AUTO_CHECK_INTERVAL_HOURS = Number(process.env.AUTO_CHECK_INTERVAL_HOURS || 24);
+
 // Where activity data is saved. If you add a Railway Volume, mount it at /data
 // and set DATA_DIR=/data so this survives redeploys. Otherwise it resets on each deploy.
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -87,6 +100,69 @@ const client = new Client({
   partials: [Partials.GuildMember],
 });
 
+// Runs the same logic as !removeunverified, but automatically and across every
+// guild the bot is in, then posts a log message instead of asking for confirmation.
+async function runAutoRemoveUnverified() {
+  if (!UNVERIFIED_ROLE_ID || AUTO_VERIFIED_ROLE_IDS.length === 0) {
+    return; // not configured yet — silently skip rather than spam errors every interval
+  }
+
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const unverifiedRole = guild.roles.cache.get(UNVERIFIED_ROLE_ID);
+      if (!unverifiedRole) continue;
+
+      const botMember = await guild.members.fetchMe();
+      if (unverifiedRole.position >= botMember.roles.highest.position) {
+        console.error(`Auto-removeunverified: my role is below ${unverifiedRole.name} in ${guild.name}, skipping.`);
+        continue;
+      }
+
+      await guild.members.fetch(); // ensure full member cache
+      const verifiedRoles = AUTO_VERIFIED_ROLE_IDS.map((id) => guild.roles.cache.get(id)).filter(Boolean);
+      if (verifiedRoles.length === 0) continue;
+
+      const toClean = guild.members.cache.filter(
+        (m) => m.roles.cache.has(unverifiedRole.id) && verifiedRoles.some((r) => m.roles.cache.has(r.id))
+      );
+
+      if (toClean.size === 0) continue; // nothing to do, no log spam on empty runs
+
+      const removed = [];
+      const failed = [];
+      for (const member of toClean.values()) {
+        try {
+          await member.roles.remove(unverifiedRole);
+          removed.push(member.user.tag);
+        } catch (err) {
+          console.error(`Auto-removeunverified: failed to remove role from ${member.user.tag}:`, err);
+          failed.push(member.user.tag);
+        }
+      }
+
+      const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
+      const lines = [
+        `🔄 **Automatic Unverified check — ${timestamp} UTC**`,
+        `✅ Removed Unverified from ${removed.length}: ${removed.join(', ')}`,
+      ];
+      if (failed.length) lines.push(`❌ Failed for ${failed.length}: ${failed.join(', ')}`);
+
+      if (LOG_CHANNEL_ID) {
+        const logChannel = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
+        if (logChannel) {
+          await logChannel.send(lines.join('\n'));
+        } else {
+          console.error(`Auto-removeunverified: could not find LOG_CHANNEL_ID ${LOG_CHANNEL_ID}`);
+        }
+      } else {
+        console.log(lines.join('\n'));
+      }
+    } catch (err) {
+      console.error(`Auto-removeunverified: unexpected error in guild ${guild.name}:`, err);
+    }
+  }
+}
+
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Prefix: ${PREFIX}`);
@@ -96,6 +172,15 @@ client.once('ready', () => {
   }
   if (TRACKED_ROLE_IDS.length === 0) {
     console.log('WARNING: No TRACKED_ROLE_ID set — !inactivity has nothing to check yet.');
+  }
+
+  if (UNVERIFIED_ROLE_ID && AUTO_VERIFIED_ROLE_IDS.length > 0) {
+    console.log(`Automatic Unverified removal is ON — checking every ${AUTO_CHECK_INTERVAL_HOURS}h.`);
+    // Run once shortly after startup, then repeat on the configured interval
+    setTimeout(runAutoRemoveUnverified, 30000);
+    setInterval(runAutoRemoveUnverified, AUTO_CHECK_INTERVAL_HOURS * 60 * 60 * 1000);
+  } else {
+    console.log('Automatic Unverified removal is OFF — set AUTO_VERIFIED_ROLE_ID to turn it on.');
   }
 });
 
@@ -402,6 +487,7 @@ client.on('messageCreate', async (message) => {
 
     return;
   }
+
 
   // ---------- !lastseen @user ----------
   if (command === 'lastseen') {
