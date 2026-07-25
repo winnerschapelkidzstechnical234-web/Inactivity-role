@@ -9,6 +9,12 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  EmbedBuilder,
+  SlashCommandBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  Events,
 } = require('discord.js');
 
 const PREFIX = process.env.PREFIX || '!';
@@ -49,6 +55,121 @@ const AUTO_CHECK_INTERVAL_HOURS = Number(process.env.AUTO_CHECK_INTERVAL_HOURS |
 // and set DATA_DIR=/data so this survives redeploys. Otherwise it resets on each deploy.
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'activity.json');
+
+// ==================== LOA (Leave of Absence) system ====================
+
+// The Discord server this bot runs in — needed to register slash commands instantly.
+const GUILD_ID = process.env.GUILD_ID || null;
+
+// Who can run /loa request — your Recording Crew roles. Comma-separated.
+const RECORDING_CREW_ROLE_IDS = (process.env.RECORDING_CREW_ROLE_ID || '')
+  .split(',')
+  .map((id) => id.trim())
+  .filter(Boolean);
+
+// Who can run /loa manage, /loa list, and click Approve/Deny — your staff/instructor roles.
+const LOA_STAFF_ROLE_IDS = (process.env.LOA_STAFF_ROLE_ID || '')
+  .split(',')
+  .map((id) => id.trim())
+  .filter(Boolean);
+
+// The role automatically given while someone is on LOA, and removed once it ends.
+const LOA_ROLE_ID = process.env.LOA_ROLE_ID || null;
+
+// Where /loa request gets typed, and where public approved/denied replies get posted.
+const LOA_CHANNEL_ID = process.env.LOA_CHANNEL_ID || null;
+
+// Where the Approve/Deny embed gets posted for staff to act on.
+const LOA_STAFF_CHANNEL_ID = process.env.LOA_STAFF_CHANNEL_ID || null;
+
+// Where the bot posts when an LOA automatically ends (pings LOA_STAFF_ROLE_IDS).
+// Defaults to the staff channel above if not set separately.
+const LOA_LOG_CHANNEL_ID = process.env.LOA_LOG_CHANNEL_ID || LOA_STAFF_CHANNEL_ID;
+
+// The timezone LOA dates are interpreted in (defaults to US Eastern).
+const LOA_TIMEZONE = process.env.LOA_TIMEZONE || 'America/New_York';
+
+// How often to check for expired LOAs, in hours.
+const LOA_CHECK_INTERVAL_HOURS = Number(process.env.LOA_CHECK_INTERVAL_HOURS || 1);
+
+const LOA_DATA_FILE = path.join(DATA_DIR, 'loas.json');
+
+function loadLoas() {
+  try {
+    const raw = fs.readFileSync(LOA_DATA_FILE, 'utf8');
+    return JSON.parse(raw);
+  } catch (err) {
+    return {};
+  }
+}
+
+function saveLoas(data) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(LOA_DATA_FILE, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error('Failed to save LOA data:', err);
+  }
+}
+
+let loas = loadLoas(); // { loaId: { userId, userTag, startDate, endDate, reason, status, ... } }
+
+function hasAnyRole(member, roleIds) {
+  return roleIds.some((id) => member.roles.cache.has(id));
+}
+
+function isRecordingCrew(member) {
+  return hasAnyRole(member, RECORDING_CREW_ROLE_IDS);
+}
+
+function isLoaStaff(member) {
+  return hasAnyRole(member, LOA_STAFF_ROLE_IDS);
+}
+
+// Parses "MM/DD/YYYY" into a plain date object (no time component)
+function parseLoaDate(text) {
+  const match = text.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!match) return null;
+  const month = Number(match[1]);
+  const day = Number(match[2]);
+  const year = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  // Reject invalid calendar dates like Feb 30 (JS Date auto-rolls those forward)
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+  return { year, month, day };
+}
+
+// Converts a LOA end date into the exact UTC moment their leave officially ends
+// (end of that calendar day, in LOA_TIMEZONE). Reuses the same Intl-based
+// zoned-time conversion approach as the sessiontime command in the other bot.
+function endOfDayUtc(year, month, day, timeZone) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  function getUtcMsForWallTimeAsIfUtc(ms) {
+    const parts = dtf.formatToParts(new Date(ms));
+    const obj = {};
+    for (const p of parts) obj[p.type] = p.value;
+    const hh = obj.hour === '24' ? 0 : Number(obj.hour);
+    return Date.UTC(Number(obj.year), Number(obj.month) - 1, Number(obj.day), hh, Number(obj.minute), Number(obj.second));
+  }
+  const utcGuess = Date.UTC(year, month - 1, day, 23, 59, 59);
+  const offset = utcGuess - getUtcMsForWallTimeAsIfUtc(utcGuess);
+  return utcGuess + offset;
+}
+
+function formatLoaDate(year, month, day) {
+  return `${String(month).padStart(2, '0')}/${String(day).padStart(2, '0')}/${year}`;
+}
+
+function findActiveOrPendingLoa(userId) {
+  return Object.entries(loas).find(
+    ([, l]) => l.userId === userId && (l.status === 'pending' || l.status === 'approved')
+  );
+}
 
 function loadActivity() {
   try {
@@ -163,6 +284,62 @@ async function runAutoRemoveUnverified() {
   }
 }
 
+// ==================== LOA slash command definitions ====================
+
+const loaCommand = new SlashCommandBuilder()
+  .setName('loa')
+  .setDescription('Recording Crew Leave of Absence system')
+  .addSubcommand((sub) => sub.setName('request').setDescription('Request a Leave of Absence'))
+  .addSubcommand((sub) =>
+    sub
+      .setName('manage')
+      .setDescription('[Staff] View or manage a recording crew member\'s LOA')
+      .addUserOption((opt) => opt.setName('user').setDescription('The member to look up').setRequired(true))
+  )
+  .addSubcommand((sub) => sub.setName('list').setDescription('[Staff] List everyone currently on LOA'))
+  .addSubcommand((sub) => sub.setName('help').setDescription('How the LOA system works'));
+
+// ==================== Automatic LOA expiry checker ====================
+
+async function runLoaExpiryCheck() {
+  if (!LOA_ROLE_ID) return;
+
+  const now = Date.now();
+  const expiredEntries = Object.entries(loas).filter(
+    ([, l]) => l.status === 'approved' && now >= l.endTimestamp
+  );
+
+  if (expiredEntries.length === 0) return;
+
+  for (const guild of client.guilds.cache.values()) {
+    const role = guild.roles.cache.get(LOA_ROLE_ID);
+    if (!role) continue;
+
+    for (const [loaId, loa] of expiredEntries) {
+      try {
+        const member = await guild.members.fetch(loa.userId).catch(() => null);
+        if (member && member.roles.cache.has(LOA_ROLE_ID)) {
+          await member.roles.remove(role);
+        }
+        loas[loaId].status = 'expired';
+        saveLoas(loas);
+
+        if (LOA_LOG_CHANNEL_ID) {
+          const logChannel = await client.channels.fetch(LOA_LOG_CHANNEL_ID).catch(() => null);
+          if (logChannel) {
+            const staffPing = LOA_STAFF_ROLE_IDS.map((id) => `<@&${id}>`).join(' ');
+            await logChannel.send(
+              `🔔 ${staffPing}\n**${loa.userTag}**'s LOA has ended (was scheduled through ${formatLoaDate(loa.endYear, loa.endMonth, loa.endDay)}). The LOA role has been automatically removed.`
+            );
+          }
+        }
+      } catch (err) {
+        console.error(`LOA expiry: failed to process ${loa.userTag}:`, err);
+      }
+    }
+  }
+}
+
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Prefix: ${PREFIX}`);
@@ -181,6 +358,29 @@ client.once('ready', () => {
     setInterval(runAutoRemoveUnverified, AUTO_CHECK_INTERVAL_HOURS * 60 * 60 * 1000);
   } else {
     console.log('Automatic Unverified removal is OFF — set AUTO_VERIFIED_ROLE_ID to turn it on.');
+  }
+
+  // Register the /loa slash command
+  if (GUILD_ID) {
+    const guild = client.guilds.cache.get(GUILD_ID);
+    if (guild) {
+      guild.commands.set([loaCommand])
+        .then(() => console.log('Slash command /loa registered successfully.'))
+        .catch((err) => console.error('Failed to register /loa slash command:', err));
+    } else {
+      console.error(`GUILD_ID ${GUILD_ID} not found — is the bot actually in that server?`);
+    }
+  } else {
+    console.log('WARNING: No GUILD_ID set — /loa slash command will not be registered.');
+  }
+
+  // Start the LOA expiry checker
+  if (LOA_ROLE_ID && RECORDING_CREW_ROLE_IDS.length > 0) {
+    console.log(`LOA system is ON — expiry checked every ${LOA_CHECK_INTERVAL_HOURS}h.`);
+    setTimeout(runLoaExpiryCheck, 30000);
+    setInterval(runLoaExpiryCheck, LOA_CHECK_INTERVAL_HOURS * 60 * 60 * 1000);
+  } else {
+    console.log('LOA system is OFF — set LOA_ROLE_ID and RECORDING_CREW_ROLE_ID to turn it on.');
   }
 });
 
@@ -503,5 +703,359 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// ==================== LOA embed builders ====================
 
+function buildRequestEmbed(loa, statusLabel, color) {
+  return new EmbedBuilder()
+    .setTitle('Leave of Absence Request')
+    .setColor(color)
+    .addFields(
+      { name: 'Requested by', value: `<@${loa.userId}>`, inline: true },
+      { name: 'Status', value: statusLabel, inline: true },
+      { name: 'Start Date', value: formatLoaDate(loa.startYear, loa.startMonth, loa.startDay), inline: true },
+      { name: 'End Date', value: formatLoaDate(loa.endYear, loa.endMonth, loa.endDay), inline: true },
+      { name: 'Reason', value: loa.reason || 'No reason given' }
+    )
+    .setTimestamp(loa.requestedAt);
+}
+
+// ==================== Interaction handling (slash commands, modals, buttons) ====================
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+    // ---------- /loa slash command ----------
+    if (interaction.isChatInputCommand() && interaction.commandName === 'loa') {
+      const sub = interaction.options.getSubcommand();
+
+      // ----- /loa request -----
+      if (sub === 'request') {
+        if (!isRecordingCrew(interaction.member)) {
+          return interaction.reply({ content: "You don't have access to this command.", ephemeral: true });
+        }
+        if (LOA_CHANNEL_ID && interaction.channelId !== LOA_CHANNEL_ID) {
+          return interaction.reply({ content: `Please use this command in <#${LOA_CHANNEL_ID}>.`, ephemeral: true });
+        }
+        const existing = findActiveOrPendingLoa(interaction.user.id);
+        if (existing) {
+          const [, l] = existing;
+          return interaction.reply({
+            content: `You already have ${l.status === 'pending' ? 'a pending' : 'an active'} LOA request. You can't submit another until that one is resolved.`,
+            ephemeral: true,
+          });
+        }
+
+        const modal = new ModalBuilder().setCustomId('loa_request_modal').setTitle('Request a Leave of Absence');
+        const startInput = new TextInputBuilder()
+          .setCustomId('start_date').setLabel('Start Date (MM/DD/YYYY)')
+          .setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('07/25/2026');
+        const endInput = new TextInputBuilder()
+          .setCustomId('end_date').setLabel('End Date (MM/DD/YYYY)')
+          .setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('08/01/2026');
+        const reasonInput = new TextInputBuilder()
+          .setCustomId('reason').setLabel('Reason').setStyle(TextInputStyle.Paragraph).setRequired(true);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(startInput),
+          new ActionRowBuilder().addComponents(endInput),
+          new ActionRowBuilder().addComponents(reasonInput)
+        );
+        return interaction.showModal(modal);
+      }
+
+      // ----- /loa manage -----
+      if (sub === 'manage') {
+        if (!isLoaStaff(interaction.member)) {
+          return interaction.reply({ content: "You don't have access to this command.", ephemeral: true });
+        }
+        const target = interaction.options.getUser('user');
+        const existing = findActiveOrPendingLoa(target.id);
+        if (!existing) {
+          return interaction.reply({ content: `${target.tag} doesn't have an active or pending LOA.`, ephemeral: true });
+        }
+        const [loaId, loa] = existing;
+        const embed = buildRequestEmbed(loa, loa.status === 'pending' ? '⏳ Pending' : '✅ Approved', loa.status === 'pending' ? 0xf1c40f : 0x2ecc71);
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`loa_cancel_${loaId}`).setLabel('Cancel LOA').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId(`loa_extend_${loaId}`).setLabel('Extend LOA').setStyle(ButtonStyle.Primary)
+        );
+        return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+      }
+
+      // ----- /loa list -----
+      if (sub === 'list') {
+        if (!isLoaStaff(interaction.member)) {
+          return interaction.reply({ content: "You don't have access to this command.", ephemeral: true });
+        }
+        const active = Object.values(loas)
+          .filter((l) => l.status === 'approved')
+          .sort((a, b) => a.endTimestamp - b.endTimestamp);
+
+        if (active.length === 0) {
+          return interaction.reply({ content: 'Nobody is currently on LOA.', ephemeral: true });
+        }
+
+        const embed = new EmbedBuilder().setTitle('Active Leaves of Absence').setColor(0x2ecc71);
+        for (const loa of active.slice(0, 25)) {
+          const daysLeft = Math.max(0, Math.ceil((loa.endTimestamp - Date.now()) / 86400000));
+          embed.addFields({
+            name: loa.userTag,
+            value: `${formatLoaDate(loa.startYear, loa.startMonth, loa.startDay)} → ${formatLoaDate(loa.endYear, loa.endMonth, loa.endDay)} (${daysLeft}d left)`,
+          });
+        }
+        return interaction.reply({ embeds: [embed], ephemeral: true });
+      }
+
+      // ----- /loa help -----
+      if (sub === 'help') {
+        const embed = new EmbedBuilder()
+          .setTitle('LOA System — How It Works')
+          .setColor(0x5865f2)
+          .setDescription(
+            `**/loa request** — Recording Crew members can request a Leave of Absence (start date, end date, reason). ` +
+            `Submitted in <#${LOA_CHANNEL_ID || 'the LOA channel'}>, then reviewed by staff.\n\n` +
+            `Once approved, you'll automatically get the LOA role for the dates you requested, and it's removed automatically once your LOA ends.`
+          );
+        return interaction.reply({ embeds: [embed], ephemeral: true });
+      }
+    }
+
+    // ---------- Modal submissions ----------
+    if (interaction.isModalSubmit()) {
+      // ----- New LOA request submitted -----
+      if (interaction.customId === 'loa_request_modal') {
+        const startRaw = interaction.fields.getTextInputValue('start_date');
+        const endRaw = interaction.fields.getTextInputValue('end_date');
+        const reason = interaction.fields.getTextInputValue('reason');
+
+        const start = parseLoaDate(startRaw);
+        const end = parseLoaDate(endRaw);
+        if (!start || !end) {
+          return interaction.reply({ content: 'Dates must be in MM/DD/YYYY format, e.g. `07/25/2026`.', ephemeral: true });
+        }
+        const startTimestamp = Date.UTC(start.year, start.month - 1, start.day);
+        const endTimestamp = endOfDayUtc(end.year, end.month, end.day, LOA_TIMEZONE);
+        if (endTimestamp <= startTimestamp) {
+          return interaction.reply({ content: 'The end date has to be after the start date.', ephemeral: true });
+        }
+
+        const loaId = `${interaction.user.id}-${Date.now()}`;
+        const loa = {
+          userId: interaction.user.id,
+          userTag: interaction.user.tag,
+          startYear: start.year, startMonth: start.month, startDay: start.day,
+          endYear: end.year, endMonth: end.month, endDay: end.day,
+          startTimestamp, endTimestamp,
+          reason,
+          status: 'pending',
+          requestedAt: Date.now(),
+        };
+        loas[loaId] = loa;
+        saveLoas(loas);
+
+        await interaction.reply(`⏳ <@${interaction.user.id}>'s LOA request has been submitted and is awaiting staff approval.`);
+
+        if (LOA_STAFF_CHANNEL_ID) {
+          const staffChannel = await client.channels.fetch(LOA_STAFF_CHANNEL_ID).catch(() => null);
+          if (staffChannel) {
+            const embed = buildRequestEmbed(loa, '⏳ Pending', 0xf1c40f);
+            const row = new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId(`loa_approve_${loaId}`).setLabel('Approve').setStyle(ButtonStyle.Success),
+              new ButtonBuilder().setCustomId(`loa_deny_${loaId}`).setLabel('Deny').setStyle(ButtonStyle.Danger)
+            );
+            const staffMsg = await staffChannel.send({ embeds: [embed], components: [row] });
+            loas[loaId].staffMessageId = staffMsg.id;
+            saveLoas(loas);
+          }
+        }
+        return;
+      }
+
+      // ----- Deny reason submitted -----
+      if (interaction.customId.startsWith('loa_deny_modal_')) {
+        const loaId = interaction.customId.replace('loa_deny_modal_', '');
+        const loa = loas[loaId];
+        if (!loa || loa.status !== 'pending') {
+          return interaction.reply({ content: 'This request is no longer pending.', ephemeral: true });
+        }
+        const reason = interaction.fields.getTextInputValue('deny_reason');
+
+        loa.status = 'denied';
+        loa.deniedBy = interaction.user.tag;
+        loa.denyReason = reason || null;
+        saveLoas(loas);
+
+        await interaction.reply({ content: 'Request denied.', ephemeral: true });
+
+        if (LOA_CHANNEL_ID) {
+          const loaChannel = await client.channels.fetch(LOA_CHANNEL_ID).catch(() => null);
+          if (loaChannel) {
+            await loaChannel.send(
+              `❌ <@${loa.userId}>'s LOA request has been denied.${reason ? `\n**Reason:** ${reason}` : ''}`
+            );
+          }
+        }
+
+        if (loa.staffMessageId && LOA_STAFF_CHANNEL_ID) {
+          const staffChannel = await client.channels.fetch(LOA_STAFF_CHANNEL_ID).catch(() => null);
+          const staffMsg = await staffChannel?.messages.fetch(loa.staffMessageId).catch(() => null);
+          if (staffMsg) {
+            const embed = buildRequestEmbed(loa, `❌ Denied by ${interaction.user.tag}`, 0xe74c3c);
+            await staffMsg.edit({ embeds: [embed], components: [] });
+          }
+        }
+        return;
+      }
+
+      // ----- Extend LOA submitted -----
+      if (interaction.customId.startsWith('loa_extend_modal_')) {
+        const loaId = interaction.customId.replace('loa_extend_modal_', '');
+        const loa = loas[loaId];
+        if (!loa || loa.status !== 'approved') {
+          return interaction.reply({ content: 'That LOA is no longer active.', ephemeral: true });
+        }
+        const newEndRaw = interaction.fields.getTextInputValue('new_end_date');
+        const newEnd = parseLoaDate(newEndRaw);
+        if (!newEnd) {
+          return interaction.reply({ content: 'Date must be in MM/DD/YYYY format.', ephemeral: true });
+        }
+        const newEndTimestamp = endOfDayUtc(newEnd.year, newEnd.month, newEnd.day, LOA_TIMEZONE);
+        if (newEndTimestamp <= loa.startTimestamp) {
+          return interaction.reply({ content: 'New end date has to be after the LOA start date.', ephemeral: true });
+        }
+
+        loa.endYear = newEnd.year; loa.endMonth = newEnd.month; loa.endDay = newEnd.day;
+        loa.endTimestamp = newEndTimestamp;
+        saveLoas(loas);
+
+        await interaction.reply({ content: `Extended to ${formatLoaDate(newEnd.year, newEnd.month, newEnd.day)}.`, ephemeral: true });
+
+        if (LOA_CHANNEL_ID) {
+          const loaChannel = await client.channels.fetch(LOA_CHANNEL_ID).catch(() => null);
+          if (loaChannel) {
+            await loaChannel.send(`📅 <@${loa.userId}>'s LOA has been extended to ${formatLoaDate(newEnd.year, newEnd.month, newEnd.day)}.`);
+          }
+        }
+        return;
+      }
+    }
+
+    // ---------- Buttons ----------
+    if (interaction.isButton()) {
+      // ----- Approve -----
+      if (interaction.customId.startsWith('loa_approve_')) {
+        if (!isLoaStaff(interaction.member)) {
+          return interaction.reply({ content: "You don't have access to this.", ephemeral: true });
+        }
+        const loaId = interaction.customId.replace('loa_approve_', '');
+        const loa = loas[loaId];
+        if (!loa || loa.status !== 'pending') {
+          return interaction.reply({ content: 'This request is no longer pending.', ephemeral: true });
+        }
+
+        loa.status = 'approved';
+        loa.approvedBy = interaction.user.tag;
+        loa.approvedAt = Date.now();
+        saveLoas(loas);
+
+        const guild = interaction.guild;
+        const member = await guild.members.fetch(loa.userId).catch(() => null);
+        const role = guild.roles.cache.get(LOA_ROLE_ID);
+        if (member && role) {
+          await member.roles.add(role).catch((err) => console.error('Failed to add LOA role:', err));
+        }
+
+        const embed = buildRequestEmbed(loa, `✅ Approved by ${interaction.user.tag}`, 0x2ecc71);
+        await interaction.update({ embeds: [embed], components: [] });
+
+        if (LOA_CHANNEL_ID) {
+          const loaChannel = await client.channels.fetch(LOA_CHANNEL_ID).catch(() => null);
+          if (loaChannel) {
+            await loaChannel.send(
+              `✅ <@${loa.userId}>'s LOA request has been approved! On leave from ` +
+              `${formatLoaDate(loa.startYear, loa.startMonth, loa.startDay)} to ${formatLoaDate(loa.endYear, loa.endMonth, loa.endDay)}.`
+            );
+          }
+        }
+        return;
+      }
+
+      // ----- Deny (opens a modal for an optional reason) -----
+      if (interaction.customId.startsWith('loa_deny_')) {
+        if (!isLoaStaff(interaction.member)) {
+          return interaction.reply({ content: "You don't have access to this.", ephemeral: true });
+        }
+        const loaId = interaction.customId.replace('loa_deny_', '');
+        const loa = loas[loaId];
+        if (!loa || loa.status !== 'pending') {
+          return interaction.reply({ content: 'This request is no longer pending.', ephemeral: true });
+        }
+
+        const modal = new ModalBuilder().setCustomId(`loa_deny_modal_${loaId}`).setTitle('Deny LOA Request');
+        const reasonInput = new TextInputBuilder()
+          .setCustomId('deny_reason').setLabel('Reason (optional)')
+          .setStyle(TextInputStyle.Paragraph).setRequired(false);
+        modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
+        return interaction.showModal(modal);
+      }
+
+      // ----- Cancel (from /loa manage) -----
+      if (interaction.customId.startsWith('loa_cancel_')) {
+        if (!isLoaStaff(interaction.member)) {
+          return interaction.reply({ content: "You don't have access to this.", ephemeral: true });
+        }
+        const loaId = interaction.customId.replace('loa_cancel_', '');
+        const loa = loas[loaId];
+        if (!loa || loa.status !== 'approved') {
+          return interaction.reply({ content: 'That LOA is no longer active.', ephemeral: true });
+        }
+
+        loa.status = 'cancelled';
+        saveLoas(loas);
+
+        const guild = interaction.guild;
+        const member = await guild.members.fetch(loa.userId).catch(() => null);
+        const role = guild.roles.cache.get(LOA_ROLE_ID);
+        if (member && role && member.roles.cache.has(LOA_ROLE_ID)) {
+          await member.roles.remove(role).catch((err) => console.error('Failed to remove LOA role on cancel:', err));
+        }
+
+        await interaction.update({ content: `LOA for <@${loa.userId}> has been cancelled.`, embeds: [], components: [] });
+
+        if (LOA_CHANNEL_ID) {
+          const loaChannel = await client.channels.fetch(LOA_CHANNEL_ID).catch(() => null);
+          if (loaChannel) {
+            await loaChannel.send(`🛑 <@${loa.userId}>'s LOA has been ended early by staff.`);
+          }
+        }
+        return;
+      }
+
+      // ----- Extend (from /loa manage — opens a modal) -----
+      if (interaction.customId.startsWith('loa_extend_')) {
+        if (!isLoaStaff(interaction.member)) {
+          return interaction.reply({ content: "You don't have access to this.", ephemeral: true });
+        }
+        const loaId = interaction.customId.replace('loa_extend_', '');
+        const loa = loas[loaId];
+        if (!loa || loa.status !== 'approved') {
+          return interaction.reply({ content: 'That LOA is no longer active.', ephemeral: true });
+        }
+
+        const modal = new ModalBuilder().setCustomId(`loa_extend_modal_${loaId}`).setTitle('Extend LOA');
+        const newEndInput = new TextInputBuilder()
+          .setCustomId('new_end_date').setLabel('New End Date (MM/DD/YYYY)')
+          .setStyle(TextInputStyle.Short).setRequired(true)
+          .setPlaceholder(formatLoaDate(loa.endYear, loa.endMonth, loa.endDay));
+        modal.addComponents(new ActionRowBuilder().addComponents(newEndInput));
+        return interaction.showModal(modal);
+      }
+    }
+  } catch (err) {
+    console.error('LOA interaction error:', err);
+    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: 'Something went wrong processing that. Check the logs.', ephemeral: true }).catch(() => {});
+    }
+  }
+});
+
+client.login(process.env.DISCORD_TOKEN);
